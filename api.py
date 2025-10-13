@@ -2,10 +2,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 import requests
 import time
 import os
+import json
+import fcntl
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -22,6 +25,11 @@ HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json"
 }
+
+# Port counter configuration
+PORT_COUNTER_FILE = Path(__file__).parent / "port_counter.json"
+CONTAINER_PORT = 3000  # Fixed container port
+INITIAL_HOST_PORT = 3003  # Starting port for auto-increment
 
 # === PYDANTIC MODELS ===
 
@@ -42,6 +50,7 @@ class ApplicationCreateRequest(BaseModel):
     name: str
     container_port: int = 3000
     host_port: int = 3001
+    domain: Optional[str] = Field(None, description="User's chosen subdomain (e.g., 'myapp' for myapp.aedify.ai)")
     build_pack: str = "nixpacks"
 
 class ApplicationCreateResponse(BaseModel):
@@ -71,13 +80,12 @@ class DeploymentStatusResponse(BaseModel):
     message: str
 
 class FullDeploymentRequest(BaseModel):
-    project_name: str
-    git_repository: str
-    git_branch: str = "main"
-    app_name: Optional[str] = None
-    container_port: int = 3000
-    host_port: int = 3001
-    env_vars: Optional[Dict[str, str]] = None
+    project_name: str = Field(..., description="Project name (letters and numbers only)")
+    subdomain: str = Field(..., description="Aedify subdomain (no special characters or spaces)")
+    git_repository: str = Field(..., description="GitHub repository URL")
+    git_branch: str = Field(default="main", description="Branch name")
+    base_directory: Optional[str] = Field(None, description="Base directory (e.g., /main-directory/sub-directory)")
+    env_vars: Optional[Dict[str, str]] = Field(None, description="Environment variables as key-value pairs")
 
 class FullDeploymentResponse(BaseModel):
     project_uuid: str
@@ -86,6 +94,8 @@ class FullDeploymentResponse(BaseModel):
     app_name: str
     deployment_status: str
     coolify_url: str
+    fqdn: str = Field(..., description="Fully qualified domain name")
+    url: str = Field(..., description="Full HTTPS URL for the application")
     message: str = "Full deployment completed"
 
 # === FASTAPI APP ===
@@ -148,6 +158,154 @@ def validate_github_url(url: str) -> str:
     if not url.endswith(".git"):
         url = f"{url}.git"
     return url
+
+def generate_system_env_vars(domain: str) -> Dict[str, str]:
+    """
+    Generate system-level environment variables based on user's domain.
+
+    Args:
+        domain: User's chosen subdomain (e.g., 'myapp' for myapp.aedify.ai)
+
+    Returns:
+        Dict of system environment variables to inject
+    """
+    # Ensure domain doesn't already include .aedify.ai
+    if domain.endswith(".aedify.ai"):
+        fqdn = domain
+    else:
+        fqdn = f"{domain}.aedify.ai"
+
+    return {
+        "COOLIFY_FQDN": fqdn,
+        "URL": f"https://{fqdn}"
+    }
+
+def validate_subdomain(subdomain: str) -> str:
+    """
+    Validate and sanitize subdomain input.
+
+    Rules:
+    - Only letters, numbers, and hyphens
+    - No spaces or special characters
+    - Convert to lowercase
+    - Strip whitespace
+
+    Args:
+        subdomain: User's chosen subdomain
+
+    Returns:
+        Sanitized subdomain
+
+    Raises:
+        HTTPException: If subdomain is invalid
+    """
+    import re
+
+    # Strip whitespace and convert to lowercase
+    subdomain = subdomain.strip().lower()
+
+    # Remove .aedify.ai if user included it
+    if subdomain.endswith(".aedify.ai"):
+        subdomain = subdomain.replace(".aedify.ai", "")
+
+    # Check if empty after cleaning
+    if not subdomain:
+        raise HTTPException(status_code=400, detail="Subdomain cannot be empty")
+
+    # Validate format: only letters, numbers, and hyphens
+    if not re.match(r'^[a-z0-9-]+$', subdomain):
+        raise HTTPException(
+            status_code=400,
+            detail="Subdomain can only contain letters, numbers, and hyphens (no spaces or special characters)"
+        )
+
+    # Cannot start or end with hyphen
+    if subdomain.startswith('-') or subdomain.endswith('-'):
+        raise HTTPException(status_code=400, detail="Subdomain cannot start or end with a hyphen")
+
+    return subdomain
+
+def validate_project_name(project_name: str) -> str:
+    """
+    Validate and sanitize project name.
+
+    Rules:
+    - Only letters and numbers
+    - No special characters or spaces
+    - Strip whitespace
+
+    Args:
+        project_name: User's chosen project name
+
+    Returns:
+        Sanitized project name
+
+    Raises:
+        HTTPException: If project name is invalid
+    """
+    import re
+
+    # Strip whitespace
+    project_name = project_name.strip()
+
+    # Check if empty
+    if not project_name:
+        raise HTTPException(status_code=400, detail="Project name cannot be empty")
+
+    # Validate format: only letters and numbers
+    if not re.match(r'^[a-zA-Z0-9]+$', project_name):
+        raise HTTPException(
+            status_code=400,
+            detail="Project name can only contain letters and numbers (no spaces or special characters)"
+        )
+
+    return project_name
+
+def initialize_port_counter():
+    """
+    Initialize the port counter file if it doesn't exist.
+    Creates port_counter.json with the initial port number.
+    """
+    if not PORT_COUNTER_FILE.exists():
+        with open(PORT_COUNTER_FILE, 'w') as f:
+            json.dump({"current_port": INITIAL_HOST_PORT}, f)
+        print(f"✅ Port counter initialized at {INITIAL_HOST_PORT}")
+
+def get_next_port() -> int:
+    """
+    Atomically get the next available host port and increment the counter.
+
+    Uses file locking to ensure thread-safety across multiple API requests.
+
+    Returns:
+        int: The next available host port
+    """
+    initialize_port_counter()
+
+    # Open file for reading and writing with exclusive lock
+    with open(PORT_COUNTER_FILE, 'r+') as f:
+        # Acquire exclusive lock (blocks until available)
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+        try:
+            # Read current port
+            data = json.load(f)
+            current_port = data["current_port"]
+
+            # Increment for next use
+            next_port = current_port + 1
+
+            # Write updated counter back to file
+            f.seek(0)
+            json.dump({"current_port": next_port}, f)
+            f.truncate()
+
+            print(f"🔢 Assigned port: {current_port} (next will be {next_port})")
+
+            return current_port
+        finally:
+            # Release lock
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 # === ENDPOINTS ===
 
@@ -217,12 +375,29 @@ def create_application(request: ApplicationCreateRequest):
     }
 
     result = coolify_post("/api/v1/applications/public", payload)
+    app_uuid = result["uuid"]
 
     # Wait for app to be provisioned
     time.sleep(3)
 
+    # If domain is provided, inject system env vars
+    if request.domain:
+        system_env_vars = generate_system_env_vars(request.domain)
+        for key, value in system_env_vars.items():
+            env_payload = {
+                "key": key,
+                "value": value,
+                "is_preview": False,
+                "is_literal": True
+            }
+            try:
+                coolify_post(f"/api/v1/applications/{app_uuid}/envs", env_payload)
+                print(f"✅ System env var set: {key} = {value}")
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to set system env var {key}: {str(e)}")
+
     return ApplicationCreateResponse(
-        uuid=result["uuid"],
+        uuid=app_uuid,
         name=result.get("name", request.name)
     )
 
@@ -285,12 +460,30 @@ def get_deployment_status(app_uuid: str):
 def full_deployment(request: FullDeploymentRequest):
     """
     Complete deployment flow: Creates project, app, sets env vars, and deploys
+
+    Matches frontend flow:
+    - Project name (letters and numbers)
+    - Aedify subdomain (no special characters or spaces)
+    - GitHub repo URL
+    - Base directory and branch (if needed)
+    - ENV variables (optional key-value pairs)
     """
     try:
+        # Validate and sanitize inputs
+        project_name = validate_project_name(request.project_name)
+        subdomain = validate_subdomain(request.subdomain)
+        git_repo = validate_github_url(request.git_repository)
+
+        # Generate app name from repo if not provided
+        app_name = git_repo.split('/')[-1].replace('.git', '')
+
+        # Get next available port (auto-increment)
+        host_port = get_next_port()
+
         # Step 1: Create project
         project_payload = {
-            "name": request.project_name,
-            "description": f"Auto-created for {request.app_name or 'application'}"
+            "name": project_name,
+            "description": f"Auto-created for {app_name}"
         }
         project = coolify_post("/api/v1/projects", project_payload)
         project_uuid = project["uuid"]
@@ -302,9 +495,6 @@ def full_deployment(request: FullDeploymentRequest):
         env_name = env["name"]
 
         # Step 3: Create application
-        git_repo = validate_github_url(request.git_repository)
-        app_name = request.app_name or git_repo.split('/')[-1].replace('.git', '')
-
         app_payload = {
             "project_uuid": project_uuid,
             "server_uuid": DEPLOY_SERVER_UUID,
@@ -314,11 +504,15 @@ def full_deployment(request: FullDeploymentRequest):
             "git_branch": request.git_branch,
             "build_pack": "nixpacks",
             "name": app_name,
-            "ports_exposes": str(request.container_port),
-            "ports_mappings": f"{request.host_port}:{request.container_port}",
+            "ports_exposes": str(CONTAINER_PORT),
+            "ports_mappings": f"{host_port}:{CONTAINER_PORT}",
             "docker_registry_image_name": DOCKERHUB_IMAGE,
             "instant_deploy": False
         }
+
+        # Add base_directory if provided
+        if request.base_directory:
+            app_payload["base_directory"] = request.base_directory
 
         app = coolify_post("/api/v1/applications/public", app_payload)
         app_uuid = app["uuid"]
@@ -327,6 +521,23 @@ def full_deployment(request: FullDeploymentRequest):
         time.sleep(3)
 
         # Step 4: Set environment variables
+        # First, inject system-level env vars (COOLIFY_FQDN and URL)
+        system_env_vars = generate_system_env_vars(subdomain)
+
+        for key, value in system_env_vars.items():
+            env_payload = {
+                "key": key,
+                "value": value,
+                "is_preview": False,
+                "is_literal": True
+            }
+            try:
+                coolify_post(f"/api/v1/applications/{app_uuid}/envs", env_payload)
+                print(f"✅ System env var set: {key} = {value}")
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to set system env var {key}: {str(e)}")
+
+        # Then, inject user-provided env vars
         if request.env_vars:
             for key, value in request.env_vars.items():
                 env_payload = {
@@ -337,9 +548,10 @@ def full_deployment(request: FullDeploymentRequest):
                 }
                 try:
                     coolify_post(f"/api/v1/applications/{app_uuid}/envs", env_payload)
+                    print(f"✅ User env var set: {key}")
                 except Exception as e:
                     # Log but continue if env var fails
-                    print(f"Warning: Failed to set env var {key}: {str(e)}")
+                    print(f"⚠️  Warning: Failed to set user env var {key}: {str(e)}")
 
         # Step 5: Trigger deployment
         deploy_payload = {"uuid": app_uuid}
@@ -353,6 +565,9 @@ def full_deployment(request: FullDeploymentRequest):
         except:
             status = "unknown"
 
+        # Get the generated system env vars for response
+        system_env_vars = generate_system_env_vars(subdomain)
+
         return FullDeploymentResponse(
             project_uuid=project_uuid,
             environment_uuid=env_uuid,
@@ -360,6 +575,8 @@ def full_deployment(request: FullDeploymentRequest):
             app_name=app_name,
             deployment_status=status,
             coolify_url=f"{COOLIFY_URL}/applications/{app_uuid}",
+            fqdn=system_env_vars["COOLIFY_FQDN"],
+            url=system_env_vars["URL"],
             message="Full deployment initiated successfully"
         )
 
