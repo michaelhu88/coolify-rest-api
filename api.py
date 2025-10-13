@@ -6,9 +6,9 @@ from typing import Optional, Dict
 import requests
 import time
 import os
-import json
-import fcntl
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -19,6 +19,7 @@ COOLIFY_URL = os.getenv("COOLIFY_URL")
 API_TOKEN = os.getenv("API_TOKEN")
 DEPLOY_SERVER_UUID = os.getenv("DEPLOY_SERVER_UUID")
 DOCKERHUB_IMAGE = os.getenv("DOCKERHUB_IMAGE")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Railway provides this
 
 HEADERS = {
     "Authorization": f"Bearer {API_TOKEN}",
@@ -27,7 +28,6 @@ HEADERS = {
 }
 
 # Port counter configuration
-PORT_COUNTER_FILE = Path(__file__).parent / "port_counter.json"
 CONTAINER_PORT = 3000  # Fixed container port
 INITIAL_HOST_PORT = 3003  # Starting port for auto-increment
 
@@ -114,6 +114,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Startup event to initialize database
+@app.on_event("startup")
+def startup_event():
+    """Initialize database tables on startup"""
+    print("🚀 Starting Coolify Deployment API...")
+    if DATABASE_URL:
+        print("📊 Initializing PostgreSQL port counter...")
+        initialize_port_counter()
+    else:
+        print("⚠️  WARNING: DATABASE_URL not set. Port counter will not work!")
+        print("   Set DATABASE_URL environment variable to use PostgreSQL.")
 
 # === HELPER FUNCTIONS ===
 
@@ -261,51 +273,113 @@ def validate_project_name(project_name: str) -> str:
 
     return project_name
 
+@contextmanager
+def get_db_connection():
+    """
+    Context manager for database connections.
+    Handles connection pooling and cleanup.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        yield conn
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+
 def initialize_port_counter():
     """
-    Initialize the port counter file if it doesn't exist.
-    Creates port_counter.json with the initial port number.
+    Initialize the port counter table in PostgreSQL if it doesn't exist.
+    Creates a table with a single row containing the current port number.
     """
-    if not PORT_COUNTER_FILE.exists():
-        with open(PORT_COUNTER_FILE, 'w') as f:
-            json.dump({"current_port": INITIAL_HOST_PORT}, f)
-        print(f"✅ Port counter initialized at {INITIAL_HOST_PORT}")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Create table if not exists
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS port_counter (
+                        id INTEGER PRIMARY KEY DEFAULT 1,
+                        current_port INTEGER NOT NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT single_row CHECK (id = 1)
+                    )
+                """)
+
+                # Insert initial value if table is empty
+                cur.execute("""
+                    INSERT INTO port_counter (id, current_port)
+                    VALUES (1, %s)
+                    ON CONFLICT (id) DO NOTHING
+                """, (INITIAL_HOST_PORT,))
+
+                conn.commit()
+                print(f"✅ Port counter table initialized")
+    except Exception as e:
+        print(f"⚠️  Port counter initialization error: {e}")
+        # If DATABASE_URL is not set, we'll handle it gracefully
+        pass
 
 def get_next_port() -> int:
     """
     Atomically get the next available host port and increment the counter.
 
-    Uses file locking to ensure thread-safety across multiple API requests.
+    Uses PostgreSQL transaction with row-level locking (SELECT FOR UPDATE)
+    to ensure thread-safety and prevent race conditions.
 
     Returns:
         int: The next available host port
     """
-    initialize_port_counter()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Lock the row and get current port
+                cur.execute("""
+                    SELECT current_port
+                    FROM port_counter
+                    WHERE id = 1
+                    FOR UPDATE
+                """)
 
-    # Open file for reading and writing with exclusive lock
-    with open(PORT_COUNTER_FILE, 'r+') as f:
-        # Acquire exclusive lock (blocks until available)
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                result = cur.fetchone()
+                if not result:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Port counter not initialized. Please contact admin."
+                    )
 
-        try:
-            # Read current port
-            data = json.load(f)
-            current_port = data["current_port"]
+                current_port = result[0]
 
-            # Increment for next use
-            next_port = current_port + 1
+                # Increment for next use
+                next_port = current_port + 1
 
-            # Write updated counter back to file
-            f.seek(0)
-            json.dump({"current_port": next_port}, f)
-            f.truncate()
+                cur.execute("""
+                    UPDATE port_counter
+                    SET current_port = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (next_port,))
 
-            print(f"🔢 Assigned port: {current_port} (next will be {next_port})")
+                conn.commit()
+                print(f"🔢 Assigned port: {current_port} (next will be {next_port})")
 
-            return current_port
-        finally:
-            # Release lock
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                return current_port
+
+    except psycopg2.Error as e:
+        print(f"❌ Database error in get_next_port: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to allocate port: Database error"
+        )
+    except Exception as e:
+        print(f"❌ Error in get_next_port: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to allocate port: {str(e)}"
+        )
 
 # === ENDPOINTS ===
 
@@ -606,4 +680,5 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))  # Railway provides PORT env variable
+    uvicorn.run(app, host="0.0.0.0", port=port)

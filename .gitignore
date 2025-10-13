@@ -1,6 +1,21 @@
 # Environment variables
 .env
 
+# Port counter (legacy file-based, not used with PostgreSQL)
+port_counter.json
+
+# Documentation and project files (optional - uncomment to exclude)
+# claude.md
+# CLAUDE.md
+# API_QUICK_START.md
+# FRONTEND_INTEGRATION.md
+
+# Frontend (should be deployed separately)
+index.html
+
+# Legacy CLI tool (not needed for Railway deployment)
+deploy_to_coolify.py
+
 # Python
 __pycache__/
 *.py[cod]
@@ -41,3 +56,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
