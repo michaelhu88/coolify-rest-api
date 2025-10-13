@@ -408,6 +408,18 @@ def create_project(request: ProjectCreateRequest):
         "description": request.description or f"Auto-created project: {request.name}"
     }
     result = coolify_post("/api/v1/projects", payload)
+
+    # Handle Coolify API returning a list of all projects instead of just the created one
+    if isinstance(result, list):
+        # Find the project by name (most recently created with this name)
+        matching_projects = [p for p in result if p.get("name") == request.name]
+        if matching_projects:
+            # Get the last one (most recent)
+            result = matching_projects[-1]
+        else:
+            # Fallback: assume the last project in the list is the newly created one
+            result = result[-1]
+
     return ProjectCreateResponse(
         uuid=result["uuid"],
         name=result.get("name", request.name)
@@ -560,6 +572,18 @@ def full_deployment(request: FullDeploymentRequest):
             "description": f"Auto-created for {app_name}"
         }
         project = coolify_post("/api/v1/projects", project_payload)
+
+        # Handle Coolify API returning a list of all projects instead of just the created one
+        if isinstance(project, list):
+            # Find the project by name (most recently created with this name)
+            matching_projects = [p for p in project if p.get("name") == project_name]
+            if matching_projects:
+                # Get the last one (most recent)
+                project = matching_projects[-1]
+            else:
+                # Fallback: assume the last project in the list is the newly created one
+                project = project[-1]
+
         project_uuid = project["uuid"]
 
         # Step 2: Get environment
