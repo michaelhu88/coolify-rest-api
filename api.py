@@ -392,6 +392,7 @@ def root():
         "endpoints": {
             "create_project": "POST /api/projects",
             "get_environment": "GET /api/projects/{uuid}/environment",
+            "get_all_applications": "GET /api/applications",
             "create_application": "POST /api/applications",
             "set_env_var": "POST /api/applications/{uuid}/envs",
             "deploy": "POST /api/applications/{uuid}/deploy",
@@ -438,6 +439,11 @@ def get_environment(project_uuid: str):
         "environment_name": env["name"],
         "project_uuid": project_uuid
     }
+
+@app.get("/api/applications")
+def get_all_applications():
+    """Get all applications from Coolify"""
+    return coolify_get("/api/v1/applications")
 
 @app.post("/api/applications", response_model=ApplicationCreateResponse)
 def create_application(request: ApplicationCreateRequest):
