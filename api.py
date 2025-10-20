@@ -381,6 +381,66 @@ def get_next_port() -> int:
             detail=f"Failed to allocate port: {str(e)}"
         )
 
+def store_deployment_mapping(subdomain: str, app_uuid: str):
+    """
+    Store subdomain → app_uuid mapping for log tracking.
+
+    Args:
+        subdomain: The subdomain (e.g., 'myapp' from myapp.aedify.ai)
+        app_uuid: The Coolify application UUID
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO deployments (subdomain, app_uuid)
+                    VALUES (%s, %s)
+                    ON CONFLICT (subdomain)
+                    DO UPDATE SET app_uuid = EXCLUDED.app_uuid, created_at = CURRENT_TIMESTAMP
+                """, (subdomain, app_uuid))
+
+                conn.commit()
+                print(f"📝 Stored deployment mapping: {subdomain} → {app_uuid}")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to store deployment mapping: {e}")
+        # Don't raise - this is not critical for deployment
+
+def get_app_uuid_by_subdomain(subdomain: str) -> str:
+    """
+    Get app_uuid by subdomain.
+
+    Args:
+        subdomain: The subdomain (e.g., 'myapp')
+
+    Returns:
+        str: The app_uuid
+
+    Raises:
+        HTTPException: If subdomain not found
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT app_uuid FROM deployments WHERE subdomain = %s
+                """, (subdomain,))
+
+                result = cur.fetchone()
+                if not result:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No deployment found for subdomain: {subdomain}"
+                    )
+
+                return result[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error: {str(e)}"
+        )
+
 # === ENDPOINTS ===
 
 @app.get("/")
@@ -397,6 +457,7 @@ def root():
             "set_env_var": "POST /api/applications/{uuid}/envs",
             "deploy": "POST /api/applications/{uuid}/deploy",
             "deployment_status": "GET /api/applications/{uuid}/status",
+            "deployment_logs": "GET /api/logs/{subdomain}",
             "full_deployment": "POST /api/deploy"
         }
     }
@@ -548,6 +609,26 @@ def get_deployment_status(app_uuid: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get deployment status: {str(e)}")
 
+@app.get("/api/logs/{subdomain}")
+def get_deployment_logs(subdomain: str):
+    """Get deployment logs by subdomain (frontend-friendly endpoint)"""
+    try:
+        # Look up app_uuid from subdomain
+        app_uuid = get_app_uuid_by_subdomain(subdomain)
+
+        # Fetch logs from Coolify
+        logs = coolify_get(f"/api/v1/applications/{app_uuid}/logs")
+
+        return {
+            "subdomain": subdomain,
+            "app_uuid": app_uuid,
+            "logs": logs
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch logs: {str(e)}")
+
 @app.post("/api/deploy", response_model=FullDeploymentResponse)
 def full_deployment(request: FullDeploymentRequest):
     """
@@ -620,6 +701,9 @@ def full_deployment(request: FullDeploymentRequest):
 
         app = coolify_post("/api/v1/applications/public", app_payload)
         app_uuid = app["uuid"]
+
+        # Store subdomain → app_uuid mapping immediately for log tracking
+        store_deployment_mapping(subdomain, app_uuid)
 
         # Wait for app to be provisioned
         time.sleep(3)
